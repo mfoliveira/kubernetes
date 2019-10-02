@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -131,7 +132,8 @@ func (mounter *Mounter) doMount(mounterPath string, mountCmd string, source stri
 		//   cgroup) until the fuse daemon dies (another --scope benefit).
 		//   Kubelet service can be restarted and the fuse daemon survives.
 		// * When the fuse daemon dies (e.g. during unmount) systemd removes the
-		//   scope automatically.
+		//   scope automatically (only if running on hybrid or unified hierarchy
+		//   cgroups; on legacy hierarchy scope is removed manually on Unmount()).
 		//
 		// systemd-mount is not used because it's too new for older distros
 		// (CentOS 7, Debian Jessie).
@@ -181,9 +183,16 @@ func detectSystemd() bool {
 
 // detectSystemdLegacyHierarchy returns true if OS runs with
 // legacy cgroup hierarchy; returns false on hybrid/unified
-// or detection error (keeps old behavior).
+// or detection error (keeps old behavior) or no systemctl.
 // See systemd: src/basic/cgroup-util.c: cg_unified_update().
 func detectSystemdLegacyHierarchy() bool {
+
+	// The legacy hierarchy scope workaround needs systemctl.
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		klog.V(2).Infof("Detected OS without systemctl")
+		return false
+	}
+
 	fstype, err := fs.FsType("/sys/fs/cgroup/")
 	if err != nil {
 		klog.V(2).Infof("error on statfs (/sys/fs/cgroup/): %s", err)
@@ -253,6 +262,33 @@ func AddSystemdScope(systemdRunPath, mountName, command string, args []string) (
 	return systemdRunPath, append(systemdRunArgs, args...)
 }
 
+// SearchSystemdScope returns the transient scope unit of
+// mountName as performed by doMount() / AddSystemdScope().
+func SearchSystemdScope(systemctlRunPath, mountName string) (string, error) {
+	command := exec.Command(systemctlRunPath, "list-units", "--type=scope")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		klog.V(4).Infof("systemctl failed with: %v", err)
+		klog.V(4).Infof("systemctl output: %s", string(output))
+		return "", err
+	}
+
+	re := regexp.MustCompile("(?m:^(.*?) .*Kubernetes transient mount for (.*)$)")
+	submatches := re.FindAllStringSubmatch(string(output[:]), -1);
+	if submatches != nil {
+		for _, submatch := range submatches {
+			if mountName == submatch[2] {
+				unit := submatch[1]
+				klog.V(4).Infof("scope unit %s found for mount %s", unit, mountName)
+				return unit, nil
+			}
+		}
+	}
+
+	klog.V(4).Infof("scope unit not found for mount %s", mountName)
+	return "", fmt.Errorf("not found")
+}
+
 // Unmount unmounts the target.
 func (mounter *Mounter) Unmount(target string) error {
 	klog.V(4).Infof("Unmounting %s", target)
@@ -261,6 +297,22 @@ func (mounter *Mounter) Unmount(target string) error {
 	if err != nil {
 		return fmt.Errorf("unmount failed: %v\nUnmounting arguments: %s\nOutput: %s", err, target, string(output))
 	}
+
+	// If systemd is running on legacy hierarchy cgroups
+	// the transient scope unit has to be stopped manually.
+	if mounter.withSystemd && mounter.withSystemdLegacyHierarchy {
+		scope, err := SearchSystemdScope("systemctl", target)
+		if err != nil {
+			klog.V(4).Infof("failed to find scope unit for mount %s, error: %v", target, err)
+		} else {
+			command = exec.Command("systemctl", "stop", scope)
+			output, err = command.CombinedOutput()
+			if err != nil {
+				klog.V(4).Infof("failed to stop scope unit %s for mount %s, error: %v", scope, target, err)
+			}
+		}
+	}
+
 	return nil
 }
 

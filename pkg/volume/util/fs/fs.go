@@ -55,6 +55,17 @@ func FsInfo(path string) (int64, int64, int64, int64, int64, int64, error) {
 	return available, capacity, usage, inodes, inodesFree, inodesUsed, nil
 }
 
+// FsType linux returns (filesystem type, error)
+// for the filesystem that path resides upon.
+func FsType(path string) (int64, error) {
+	statfs := &unix.Statfs_t{}
+	err := unix.Statfs(path, statfs)
+	if err != nil {
+		return 0, err
+	}
+	return int64(statfs.Type), nil
+}
+
 // DiskUsage gets disk usage of specified path.
 func DiskUsage(path string) (*resource.Quantity, error) {
 	// First check whether the quota system knows about this directory

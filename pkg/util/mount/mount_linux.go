@@ -27,8 +27,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"golang.org/x/sys/unix"
 
 	"k8s.io/klog"
+	"k8s.io/kubernetes/pkg/volume/util/fs"
 	utilexec "k8s.io/utils/exec"
 	utilio "k8s.io/utils/io"
 )
@@ -44,7 +46,13 @@ const (
 	fsckErrorsCorrected = 1
 	// 'fsck' found errors but exited without correcting them
 	fsckErrorsUncorrected = 4
+
+	// Defined by Linux - the type number for cgroupfs, cgroup2fs, and tmpfs.
+	linuxCgroupSuperMagic   = 0x27e0eb
+	linuxCgroup2SuperMagic  = 0x63677270
+	linuxTmpfsMagic         = 0x01021994
 )
+
 
 // Mounter provides the default implementation of mount.Interface
 // for the linux platform.  This implementation assumes that the
@@ -52,6 +60,7 @@ const (
 type Mounter struct {
 	mounterPath string
 	withSystemd bool
+	withSystemdLegacyHierarchy bool
 }
 
 // New returns a mount.Interface for the current system.
@@ -61,6 +70,7 @@ func New(mounterPath string) Interface {
 	return &Mounter{
 		mounterPath: mounterPath,
 		withSystemd: detectSystemd(),
+		withSystemdLegacyHierarchy: detectSystemdLegacyHierarchy(),
 	}
 }
 
@@ -167,6 +177,52 @@ func detectSystemd() bool {
 	}
 	klog.V(2).Infof("Detected OS with systemd")
 	return true
+}
+
+// detectSystemdLegacyHierarchy returns true if OS runs with
+// legacy cgroup hierarchy; returns false on hybrid/unified
+// or detection error (keeps old behavior).
+// See systemd: src/basic/cgroup-util.c: cg_unified_update().
+func detectSystemdLegacyHierarchy() bool {
+	fstype, err := fs.FsType("/sys/fs/cgroup/")
+	if err != nil {
+		klog.V(2).Infof("error on statfs (/sys/fs/cgroup/): %s", err)
+		return false
+	}
+
+	if fstype == linuxCgroup2SuperMagic {
+		klog.V(2).Infof("/sys/fs/cgroup/ on cgroup2fs: unified hierarchy (full)")
+		return false
+	} else if fstype == linuxTmpfsMagic {
+		fstype, err = fs.FsType("/sys/fs/cgroup/unified/")
+		if err == nil && fstype == linuxCgroup2SuperMagic {
+			klog.V(2).Infof("/sys/fs/cgroup/unified/ on cgroup2fs: unified hierarchy (systemd/hybrid)")
+			return false
+		} else {
+			fstype, err = fs.FsType("/sys/fs/cgroup/systemd/")
+			if err != nil {
+				klog.V(2).Infof("error on statfs (/sys/fs/cgroup/systemd/): %s", err)
+				return false
+			}
+
+			if fstype == linuxCgroup2SuperMagic {
+				klog.V(2).Infof("/sys/fs/cgroup/systemd/ on cgroup2fs: unified hierarchy (systemd/v232)")
+				return false
+			} else if fstype == linuxCgroupSuperMagic {
+				klog.V(2).Infof("/sys/fs/cgroup/systemd/ on cgroupfs: legacy hierarchy")
+				return true
+			} else {
+				klog.V(2).Infof("/sys/fs/cgroup/systemd/ on unknown filesystem type (error)")
+				return false
+			}
+		}
+	} else {
+		klog.V(2).Infof("/sys/fs/cgroup/ on unknown filesystem type (error)")
+		return false
+	}
+
+	// This is not reached; just in case.
+	return false
 }
 
 // MakeMountArgs makes the arguments to the mount(8) command.
